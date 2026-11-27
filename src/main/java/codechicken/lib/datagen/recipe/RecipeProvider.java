@@ -1,0 +1,282 @@
+package codechicken.lib.datagen.recipe;
+
+import net.minecraft.advancements.Advancement;
+import net.minecraft.advancements.AdvancementHolder;
+import net.minecraft.advancements.triggers.CriteriaTriggers;
+import net.minecraft.advancements.triggers.Criterion;
+import net.minecraft.advancements.triggers.EnterBlockTrigger;
+import net.minecraft.advancements.triggers.InventoryChangeTrigger;
+import net.minecraft.advancements.predicates.ItemPredicate;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.HolderSet;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.data.CachedOutput;
+import net.minecraft.data.worldgen.BootstrapContext;
+import net.minecraft.core.registries.MultiRegistryBootstrap;
+import net.minecraft.core.HolderGetter;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.Registry;
+import net.minecraft.data.DataProvider;
+import net.minecraft.data.PackOutput;
+import net.minecraft.resources.Identifier;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.ItemStackTemplate;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.level.ItemLike;
+import net.minecraft.world.level.block.Block;
+import net.neoforged.neoforge.common.conditions.ConditionalOps;
+import net.neoforged.neoforge.common.conditions.WithConditions;
+
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
+
+/**
+ * Created by covers1624 on 27/12/20.
+ */
+public abstract class RecipeProvider implements DataProvider {
+
+    private final Map<Identifier, RecipeBuilder> recipes = new LinkedHashMap<>();
+    private final CompletableFuture<HolderLookup.Provider> registries;
+
+    private BootstrapContext<Recipe<?>> recipeContext;
+    private BootstrapContext<Advancement> advancementContext;
+    private final PackOutput.PathProvider recipePath;
+    private final PackOutput.PathProvider advancementPath;
+    protected final String modId;
+
+    public RecipeProvider(CompletableFuture<HolderLookup.Provider> registries, PackOutput output, String modId) {
+        this.registries = registries;
+        this.modId = modId;
+        recipePath = output.createRegistryElementsPathProvider(Registries.RECIPE);
+        advancementPath = output.createRegistryElementsPathProvider(Registries.ADVANCEMENT);
+    }
+
+    @Override
+    public final CompletableFuture<Void> run(CachedOutput cache) {
+        return registries.thenCompose(registries -> run(cache, registries));
+    }
+
+    private CompletableFuture<Void> run(CachedOutput cache, HolderLookup.Provider registries) {
+        // Generate and bind new recipe holders before serializing either registry.
+        // The base recipe/advancement registries must not also be in the context.
+        var context=HolderLookup.Provider.create(registries.listRegistries().filter(r -> !isOutputRegistry(r.key())));
+        var fallback=HolderLookup.Provider.create(registries.listRegistries().filter(r -> isOutputRegistry(r.key())));
+        var cloner=new net.minecraft.core.Cloner.Factory();
+        cloner.addCodec(Registries.RECIPE,Recipe.DIRECT_CODEC);
+        cloner.addCodec(Registries.ADVANCEMENT,Advancement.CODEC);
+        var generated=new net.minecraft.core.RegistrySetBuilder().add(bootstrap()).buildPatch(context,fallback,cloner);
+        var output=generated.patchesWithConditions();
+        List<CompletableFuture<?>> futures=new ArrayList<>();
+        writeRegistry(cache,output,Registries.RECIPE,Recipe.DIRECT_CODEC,recipePath,futures);
+        writeRegistry(cache,output,Registries.ADVANCEMENT,Advancement.CODEC,advancementPath,futures);
+        return CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));
+    }
+
+    static boolean isOutputRegistry(ResourceKey<? extends Registry<?>> key) {
+        return key.equals(Registries.RECIPE)||key.equals(Registries.ADVANCEMENT);
+    }
+
+    private static <T> void writeRegistry(CachedOutput cache,
+            net.neoforged.neoforge.common.data.RegistriesWithConditions output,
+            ResourceKey<? extends Registry<T>> key,com.mojang.serialization.Codec<T> codec,
+            PackOutput.PathProvider path,List<CompletableFuture<?>> futures) {
+        var conditional=ConditionalOps.createConditionalCodecWithConditions(codec);
+        var conditions=output.conditionsByRegistry().getOrDefault(key,Map.of());
+        output.lookupOrThrow(key).listElements().forEach(holder -> {
+            var id=holder.key();
+            futures.add(DataProvider.saveStable(cache,output,conditional,
+                    Optional.of(new WithConditions<>(conditions.getOrDefault(id,List.of()),holder.value())),
+                    path.json(id.identifier())));
+        });
+    }
+
+    public final MultiRegistryBootstrap bootstrap() {
+        return new MultiRegistryBootstrap() {
+            @Override
+            public Set<ResourceKey<? extends Registry<?>>> requestedRegistries() {
+                return Set.of(Registries.RECIPE, Registries.ADVANCEMENT);
+            }
+
+            @Override
+            public void run(MultiRegistryBootstrap.BootstrapGetter getter) {
+                try {
+                    recipeContext = getter.get(Registries.RECIPE);
+                    advancementContext = getter.get(Registries.ADVANCEMENT);
+                    recipes.clear();
+                    registerRecipes();
+                    for (RecipeBuilder builder : recipes.values()) {
+                        builder.register(recipeContext, advancementContext);
+                    }
+                } finally {
+                    recipes.clear();
+                    recipeContext = null;
+                    advancementContext = null;
+                }
+            }
+        };
+    }
+
+    protected final BootstrapContext<Recipe<?>> recipeContext() {
+        return Objects.requireNonNull(recipeContext);
+    }
+
+    protected final BootstrapContext<Advancement> advancementContext() {
+        return Objects.requireNonNull(advancementContext);
+    }
+
+    private HolderGetter<Item> itemLookup() {
+        return recipeContext().lookup(Registries.ITEM);
+    }
+
+    protected abstract void registerRecipes();
+
+    protected <T extends RecipeBuilder> T builder(T builder) {
+        if (recipes.containsKey(builder.getId())) {
+            throw new IllegalArgumentException("Recipe with id '" + builder.getId() + "' already exists.");
+        }
+        recipes.put(builder.getId(), builder);
+        return builder;
+    }
+
+    //@formatter:off
+    protected ShapedRecipeBuilder shapedRecipe(ItemLike result) { return builder(ShapedRecipeBuilder.builder(result, 1)); }
+    protected ShapedRecipeBuilder shapedRecipe(ItemLike result, int count) { return builder(ShapedRecipeBuilder.builder(new ItemStackTemplate(result.asItem(), count))); }
+    protected ShapedRecipeBuilder shapedRecipe(ItemLike result, int count, Identifier id) { return builder(ShapedRecipeBuilder.builder(new ItemStackTemplate(result.asItem(), count), id)); }
+    protected ShapedRecipeBuilder shapedRecipe(Supplier<? extends ItemLike> result) { return builder(ShapedRecipeBuilder.builder(result.get(), 1)); }
+    protected ShapedRecipeBuilder shapedRecipe(Supplier<? extends ItemLike> result, int count) { return builder(ShapedRecipeBuilder.builder(new ItemStackTemplate(result.get().asItem(), count))); }
+    protected ShapedRecipeBuilder shapedRecipe(Supplier<? extends ItemLike> result, int count, Identifier id) { return builder(ShapedRecipeBuilder.builder(new ItemStackTemplate(result.get().asItem(), count), id)); }
+    protected ShapedRecipeBuilder shapedRecipe(ItemStack result) { return builder(ShapedRecipeBuilder.builder(result, BuiltInRegistries.ITEM.getKey(result.getItem()))); }
+    protected ShapedRecipeBuilder shapedRecipe(ItemStackTemplate result) { return builder(ShapedRecipeBuilder.builder(result, result.typeHolder().unwrapKey().orElseThrow().identifier())); }
+    protected ShapedRecipeBuilder shapedRecipe(ItemStack result, Identifier id) { return builder(ShapedRecipeBuilder.builder(result, id)); }
+    protected ShapedRecipeBuilder shapedRecipe(ItemStackTemplate result, Identifier id) { return builder(ShapedRecipeBuilder.builder(result, id)); }
+
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemLike result) { return builder(ShapelessRecipeBuilder.builder(result, 1)); }
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemLike result, int count) { return builder(ShapelessRecipeBuilder.builder(new ItemStackTemplate(result.asItem(), count))); }
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemLike result, int count, Identifier id) { return builder(ShapelessRecipeBuilder.builder(new ItemStackTemplate(result.asItem(), count), id)); }
+    protected ShapelessRecipeBuilder shapelessRecipe(Supplier<? extends ItemLike> result) { return builder(ShapelessRecipeBuilder.builder(result.get(), 1)); }
+    protected ShapelessRecipeBuilder shapelessRecipe(Supplier<? extends ItemLike> result, int count) { return builder(ShapelessRecipeBuilder.builder(new ItemStackTemplate(result.get().asItem(), count))); }
+    protected ShapelessRecipeBuilder shapelessRecipe(Supplier<? extends ItemLike> result, int count, Identifier id) { return builder(ShapelessRecipeBuilder.builder(new ItemStackTemplate(result.get().asItem(), count), id)); }
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemStack result) { return builder(ShapelessRecipeBuilder.builder(result, BuiltInRegistries.ITEM.getKey(result.getItem()))); }
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemStackTemplate result) { return builder(ShapelessRecipeBuilder.builder(result, result.typeHolder().unwrapKey().orElseThrow().identifier())); }
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemStack result, Identifier id) { return builder(ShapelessRecipeBuilder.builder(result, id)); }
+    protected ShapelessRecipeBuilder shapelessRecipe(ItemStackTemplate result, Identifier id) { return builder(ShapelessRecipeBuilder.builder(result, id)); }
+
+    protected FurnaceRecipeBuilder smelting(ItemLike result) { return builder(FurnaceRecipeBuilder.smelting(result, 1)); }
+    protected FurnaceRecipeBuilder smelting(ItemLike result, int count) { return builder(FurnaceRecipeBuilder.smelting(new ItemStackTemplate(result.asItem(), count))); }
+    protected FurnaceRecipeBuilder smelting(ItemLike result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.smelting(new ItemStackTemplate(result.asItem(), count), id)); }
+    protected FurnaceRecipeBuilder smelting(Supplier<? extends ItemLike> result) { return builder(FurnaceRecipeBuilder.smelting(result.get(), 1)); }
+    protected FurnaceRecipeBuilder smelting(Supplier<? extends ItemLike> result, int count) { return builder(FurnaceRecipeBuilder.smelting(new ItemStackTemplate(result.get().asItem(), count))); }
+    protected FurnaceRecipeBuilder smelting(Supplier<? extends ItemLike> result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.smelting(new ItemStackTemplate(result.get().asItem(), count), id)); }
+    protected FurnaceRecipeBuilder smelting(ItemStack result) { return builder(FurnaceRecipeBuilder.smelting(result, BuiltInRegistries.ITEM.getKey(result.getItem()))); }
+    protected FurnaceRecipeBuilder smelting(ItemStackTemplate result) { return builder(FurnaceRecipeBuilder.smelting(result, result.typeHolder().unwrapKey().orElseThrow().identifier())); }
+    protected FurnaceRecipeBuilder smelting(ItemStack result, Identifier id) { return builder(FurnaceRecipeBuilder.smelting(result, id)); }
+    protected FurnaceRecipeBuilder smelting(ItemStackTemplate result, Identifier id) { return builder(FurnaceRecipeBuilder.smelting(result, id)); }
+
+    protected FurnaceRecipeBuilder blasting(ItemLike result) { return builder(FurnaceRecipeBuilder.blasting(result, 1)); }
+    protected FurnaceRecipeBuilder blasting(ItemLike result, int count) { return builder(FurnaceRecipeBuilder.blasting(new ItemStackTemplate(result.asItem(), count))); }
+    protected FurnaceRecipeBuilder blasting(ItemLike result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.blasting(new ItemStackTemplate(result.asItem(), count), id)); }
+    protected FurnaceRecipeBuilder blasting(Supplier<? extends ItemLike> result) { return builder(FurnaceRecipeBuilder.blasting(result.get(), 1)); }
+    protected FurnaceRecipeBuilder blasting(Supplier<? extends ItemLike> result, int count) { return builder(FurnaceRecipeBuilder.blasting(new ItemStackTemplate(result.get().asItem(), count))); }
+    protected FurnaceRecipeBuilder blasting(Supplier<? extends ItemLike> result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.blasting(new ItemStackTemplate(result.get().asItem(), count), id)); }
+    protected FurnaceRecipeBuilder blasting(ItemStack result) { return builder(FurnaceRecipeBuilder.blasting(result, BuiltInRegistries.ITEM.getKey(result.getItem()))); }
+    protected FurnaceRecipeBuilder blasting(ItemStackTemplate result) { return builder(FurnaceRecipeBuilder.blasting(result, result.typeHolder().unwrapKey().orElseThrow().identifier())); }
+    protected FurnaceRecipeBuilder blasting(ItemStack result, Identifier id) { return builder(FurnaceRecipeBuilder.blasting(result, id)); }
+    protected FurnaceRecipeBuilder blasting(ItemStackTemplate result, Identifier id) { return builder(FurnaceRecipeBuilder.blasting(result, id)); }
+
+    protected FurnaceRecipeBuilder smoking(ItemLike result) { return builder(FurnaceRecipeBuilder.smoking(result, 1)); }
+    protected FurnaceRecipeBuilder smoking(ItemLike result, int count) { return builder(FurnaceRecipeBuilder.smoking(new ItemStackTemplate(result.asItem(), count))); }
+    protected FurnaceRecipeBuilder smoking(ItemLike result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.smoking(new ItemStackTemplate(result.asItem(), count), id)); }
+    protected FurnaceRecipeBuilder smoking(Supplier<? extends ItemLike> result) { return builder(FurnaceRecipeBuilder.smoking(result.get(), 1)); }
+    protected FurnaceRecipeBuilder smoking(Supplier<? extends ItemLike> result, int count) { return builder(FurnaceRecipeBuilder.smoking(new ItemStackTemplate(result.get().asItem(), count))); }
+    protected FurnaceRecipeBuilder smoking(Supplier<? extends ItemLike> result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.smoking(new ItemStackTemplate(result.get().asItem(), count), id)); }
+    protected FurnaceRecipeBuilder smoking(ItemStack result) { return builder(FurnaceRecipeBuilder.smoking(result, BuiltInRegistries.ITEM.getKey(result.getItem()))); }
+    protected FurnaceRecipeBuilder smoking(ItemStackTemplate result) { return builder(FurnaceRecipeBuilder.smoking(result, result.typeHolder().unwrapKey().orElseThrow().identifier())); }
+    protected FurnaceRecipeBuilder smoking(ItemStack result, Identifier id) { return builder(FurnaceRecipeBuilder.smoking(result, id)); }
+    protected FurnaceRecipeBuilder smoking(ItemStackTemplate result, Identifier id) { return builder(FurnaceRecipeBuilder.smoking(result, id)); }
+
+    protected FurnaceRecipeBuilder campfire(ItemLike result) { return builder(FurnaceRecipeBuilder.campfire(result, 1)); }
+    protected FurnaceRecipeBuilder campfire(ItemLike result, int count) { return builder(FurnaceRecipeBuilder.campfire(new ItemStackTemplate(result.asItem(), count))); }
+    protected FurnaceRecipeBuilder campfire(ItemLike result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.campfire(new ItemStackTemplate(result.asItem(), count), id)); }
+    protected FurnaceRecipeBuilder campfire(Supplier<? extends ItemLike> result) { return builder(FurnaceRecipeBuilder.campfire(result.get(), 1)); }
+    protected FurnaceRecipeBuilder campfire(Supplier<? extends ItemLike> result, int count) { return builder(FurnaceRecipeBuilder.campfire(new ItemStackTemplate(result.get().asItem(), count))); }
+    protected FurnaceRecipeBuilder campfire(Supplier<? extends ItemLike> result, int count, Identifier id) { return builder(FurnaceRecipeBuilder.campfire(new ItemStackTemplate(result.get().asItem(), count), id)); }
+    protected FurnaceRecipeBuilder campfire(ItemStack result) { return builder(FurnaceRecipeBuilder.campfire(result, BuiltInRegistries.ITEM.getKey(result.getItem()))); }
+    protected FurnaceRecipeBuilder campfire(ItemStackTemplate result) { return builder(FurnaceRecipeBuilder.campfire(result, result.typeHolder().unwrapKey().orElseThrow().identifier())); }
+    protected FurnaceRecipeBuilder campfire(ItemStack result, Identifier id) { return builder(FurnaceRecipeBuilder.campfire(result, id)); }
+    protected FurnaceRecipeBuilder campfire(ItemStackTemplate result, Identifier id) { return builder(FurnaceRecipeBuilder.campfire(result, id)); }
+
+    protected ShapedRecipeBuilder customShaped(ItemLike result, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(result, 1, factory)); }
+    protected ShapedRecipeBuilder customShaped(ItemLike result, int count, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(new ItemStackTemplate(result.asItem(), count), factory)); }
+    protected ShapedRecipeBuilder customShaped(ItemLike result, int count, Identifier id, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(new ItemStackTemplate(result.asItem(), count), id, factory)); }
+    protected ShapedRecipeBuilder customShaped(Supplier<? extends ItemLike> result, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(result.get(), 1, factory)); }
+    protected ShapedRecipeBuilder customShaped(Supplier<? extends ItemLike> result, int count, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(new ItemStackTemplate(result.get().asItem(), count), factory)); }
+    protected ShapedRecipeBuilder customShaped(Supplier<? extends ItemLike> result, int count, Identifier id, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(new ItemStackTemplate(result.get().asItem(), count), id, factory)); }
+    protected ShapedRecipeBuilder customShaped(ItemStack result, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(result, BuiltInRegistries.ITEM.getKey(result.getItem()), factory)); }
+    protected ShapedRecipeBuilder customShaped(ItemStackTemplate result, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(result, result.typeHolder().unwrapKey().orElseThrow().identifier(), factory)); }
+    protected ShapedRecipeBuilder customShaped(ItemStack result, Identifier id, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(result, id, factory)); }
+    protected ShapedRecipeBuilder customShaped(ItemStackTemplate result, Identifier id, ShapedRecipeBuilder.Factory factory) { return builder(ShapedRecipeBuilder.custom(result, id, factory)); }
+
+    protected ShapelessRecipeBuilder customShapeless(ItemLike result, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(result, 1, factory)); }
+    protected ShapelessRecipeBuilder customShapeless(ItemLike result, int count, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(new ItemStackTemplate(result.asItem(), count), factory)); }
+    protected ShapelessRecipeBuilder customShapeless(ItemLike result, int count, Identifier id, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(new ItemStackTemplate(result.asItem(), count), id, factory)); }
+    protected ShapelessRecipeBuilder customShapeless(Supplier<? extends ItemLike> result, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(result.get(), 1, factory)); }
+    protected ShapelessRecipeBuilder customShapeless(Supplier<? extends ItemLike> result, int count, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(new ItemStackTemplate(result.get().asItem(), count), factory)); }
+    protected ShapelessRecipeBuilder customShapeless(Supplier<? extends ItemLike> result, int count, Identifier id, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(new ItemStackTemplate(result.get().asItem(), count), id, factory)); }
+    protected ShapelessRecipeBuilder customShapeless(ItemStack result, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(result, BuiltInRegistries.ITEM.getKey(result.getItem()), factory)); }
+    protected ShapelessRecipeBuilder customShapeless(ItemStackTemplate result, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(result, result.typeHolder().unwrapKey().orElseThrow().identifier(), factory)); }
+    protected ShapelessRecipeBuilder customShapeless(ItemStack result, Identifier id, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(result, id, factory)); }
+    protected ShapelessRecipeBuilder customShapeless(ItemStackTemplate result, Identifier id, ShapelessRecipeBuilder.Factory factory) { return builder(ShapelessRecipeBuilder.custom(result, id, factory)); }
+
+    protected FurnaceRecipeBuilder customFurnace(ItemLike result, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(result, 1, factory)); }
+    protected FurnaceRecipeBuilder customFurnace(ItemLike result, int count, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(new ItemStackTemplate(result.asItem(), count), factory)); }
+    protected FurnaceRecipeBuilder customFurnace(ItemLike result, int count, Identifier id, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(new ItemStackTemplate(result.asItem(), count), id, factory)); }
+    protected FurnaceRecipeBuilder customFurnace(Supplier<? extends ItemLike> result, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(result.get(), 1, factory)); }
+    protected FurnaceRecipeBuilder customFurnace(Supplier<? extends ItemLike> result, int count, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(new ItemStackTemplate(result.get().asItem(), count), factory)); }
+    protected FurnaceRecipeBuilder customFurnace(Supplier<? extends ItemLike> result, int count, Identifier id, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(new ItemStackTemplate(result.get().asItem(), count), id, factory)); }
+    protected FurnaceRecipeBuilder customFurnace(ItemStack result, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(result, BuiltInRegistries.ITEM.getKey(result.getItem()), factory)); }
+    protected FurnaceRecipeBuilder customFurnace(ItemStackTemplate result, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(result, result.typeHolder().unwrapKey().orElseThrow().identifier(), factory)); }
+    protected FurnaceRecipeBuilder customFurnace(ItemStack result, Identifier id, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(result, id, factory)); }
+    protected FurnaceRecipeBuilder customFurnace(ItemStackTemplate result, Identifier id, FurnaceRecipeBuilder.Factory factory) { return builder(FurnaceRecipeBuilder.custom(result, id, factory)); }
+
+    protected SpecialCraftingRecipeBuilder special(ItemLike id, SpecialCraftingRecipeBuilder.Factory factory) { return builder(SpecialCraftingRecipeBuilder.builder(id, factory)); }
+    protected SpecialCraftingRecipeBuilder special(Supplier<? extends ItemLike> id, SpecialCraftingRecipeBuilder.Factory factory) { return builder(SpecialCraftingRecipeBuilder.builder(id.get(), factory)); }
+    protected SpecialCraftingRecipeBuilder special(ItemStack id, SpecialCraftingRecipeBuilder.Factory factory) { return builder(SpecialCraftingRecipeBuilder.builder(id, factory)); }
+    protected SpecialCraftingRecipeBuilder special(String id, SpecialCraftingRecipeBuilder.Factory factory) { return builder(SpecialCraftingRecipeBuilder.builder(id, factory)); }
+    protected SpecialCraftingRecipeBuilder special(Identifier id, SpecialCraftingRecipeBuilder.Factory factory) { return builder(SpecialCraftingRecipeBuilder.builder(id, factory)); }
+    //@formatter:on
+
+    protected Criterion<?> enteredBlock(Block blockIn) {
+        return CriteriaTriggers.ENTER_BLOCK.createCriterion(new EnterBlockTrigger.TriggerInstance(Optional.empty(), Optional.of(HolderSet.direct(blockIn.builtInRegistryHolder())), Optional.empty()));
+    }
+
+    protected Criterion<?> hasItem(ItemLike itemIn) {
+        return hasItem(ItemPredicate.Builder.item().of(itemLookup(), itemIn).build());
+    }
+
+    protected Criterion<?> hasItem(Supplier<? extends ItemLike> itemIn) {
+        return hasItem(itemIn.get());
+    }
+
+    protected Criterion<?> hasItem(TagKey<Item> tagIn) {
+        return hasItem(ItemPredicate.Builder.item().of(itemLookup(), tagIn).build());
+    }
+
+    protected Criterion<?> hasItem(ItemPredicate... predicates) {
+        return CriteriaTriggers.INVENTORY_CHANGED.createCriterion(
+                new InventoryChangeTrigger.TriggerInstance(
+                        Optional.empty(),
+                        InventoryChangeTrigger.TriggerInstance.Slots.ANY,
+                        List.of(predicates)
+                )
+        );
+    }
+
+    @Override
+    public String getName() {
+        return modId + " Recipes.";
+    }
+}

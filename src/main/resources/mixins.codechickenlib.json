@@ -1,0 +1,27 @@
+{
+    "required": true,
+    "minVersion": "0.8",
+    "package": "codechicken.lib.internal.mixin",
+    "plugin": "codechicken.lib.internal.mixin.CCLMixinPlugin",
+    "target": "@env(DEFAULT)",
+    "compatibilityLevel": "JAVA_25",
+    "client": [
+        "dev.GameNarratorMixin",
+        "MinecraftMixin",
+        "SectionCompilerMixin",
+        "FluidRendererMixin",
+        "BlockModelResolverMixin",
+        "BlockBreakingMixin",
+        "BlockBreakingExtractorMixin",
+        "ContainerHighlightMixin",
+        "CursorTypeAccessor",
+        "ItemStackRenderStateAccessor",
+        "ItemLayerAccessor",
+        "GuiItemRenderStateMixin",
+        "GuiGraphicsExtractorAccessor",
+        "GuiItemAtlasTintMixin",
+        "GuiPipTintMixin",
+        "GuiEntityRenderStateMixin",
+        "TextureManagerAccessor"
+    ]
+}
